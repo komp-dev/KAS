@@ -1,0 +1,400 @@
+<html>
+
+<head>
+    <title>KAS Obs Overlay</title>
+    <meta charset="UTF-8">
+    <style>
+        body {
+            color: #f0f0f0;
+            font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+        }
+
+        table {
+            border: 1px solid transparent;
+            border-collapse: collapse;
+            border-spacing: 0;
+            width: 480px;
+            font-size: 24px;
+        }
+
+        table tr th {
+            border: 1px solid transparent;
+            padding: 4px 10px;
+        }
+
+        table tr td {
+            border: 1px solid transparent;
+            padding: 4px 10px;
+        }
+
+        #history table tr td:nth-child(1) {
+            min-width: 100px;
+        }
+
+        #history table tr td:nth-child(2) {
+            text-align: center;
+            font-size: medium;
+            width: 2%;
+        }
+
+        #history table tr td:nth-child(3) {
+            text-align: right;
+        }
+
+        #progress {
+            width: 480px;
+        }
+
+        #score {
+            text-align: right;
+            font-size: 52px;
+            font-weight: bold;
+            padding-right: 10px;
+            margin: 0;
+        }
+
+        #timer {
+            text-align: right;
+            font-size: 28px;
+            font-weight: bold;
+            padding-right: 10px;
+            margin: 16px 0 0 0;
+        }
+
+        #info table tr td:nth-child(2) {
+            text-align: right;
+        }
+    </style>
+
+    <script>
+        let KAS_Socket = null;
+        let KAS_RemoteStatus = 0;
+        let KAS_RetryCount = 0;
+        let KAS_Debug = false;
+        let KAS_AppleState = "idle";
+        let KAS_Version = 1;
+        let KAS_MaxRows = 18;
+
+        function tryConnectToServer() {
+            if (KAS_RemoteStatus == 1 || KAS_Socket != null) {
+                return;
+            }
+
+            KAS_Socket = new WebSocket("ws://localhost:8765");
+
+            KAS_Socket.onopen = function (event) {
+                log_dbg("Connected to server.");
+                KAS_RemoteStatus = 1;
+                KAS_RetryCount = 0;
+                sendClientInfo();
+                clearHistory();
+            };
+
+            KAS_Socket.onmessage = function (event) {
+                log_dbg("Received message: ", event.data);
+                processMessage(event.data);
+            };
+
+            KAS_Socket.onclose = function (event) {
+                if (KAS_RemoteStatus == 1) {
+                    log_dbg("Disconnected from server.");
+                    KAS_Socket = null;
+                    KAS_RemoteStatus = 0;
+                }
+            };
+
+            KAS_Socket.onerror = function (event) {
+                if (KAS_RemoteStatus == 0) {
+                    log_dbg("Failed to connect to server!");
+                }
+
+                KAS_Socket.close();
+                KAS_Socket = null;
+                KAS_RemoteStatus = 0;
+            };
+        }
+
+        function sendClientInfo() {
+            const client = new Object();
+            client.name = "obs";
+            client.version = KAS_Version;
+            sendToServer("clientInfo", client);
+        }
+
+        function sendToServer(msg, obj) {
+            if (KAS_Socket != null && KAS_RemoteStatus == 1) {
+                const payload = new Object();
+                payload.msg = msg;
+                payload.data = obj;
+                KAS_Socket.send(JSON.stringify(payload));
+            }
+        }
+
+        function getAttemptsTableBody() {
+            const table = document.getElementById("attempts");
+            return table.tBodies[0] || table.createElement("tbody");
+        }
+
+        function clearHistory() {
+            log_dbg("Clearing history...")
+
+            const attempts = getAttemptsTableBody();
+            attempts.replaceChildren();
+        }
+
+        function addAttemptToTable(attempt) {
+            log_dbg("Adding new attempt.");
+
+            const attempts = getAttemptsTableBody();
+            const tr = attempts.insertRow();
+            {
+                const tdNo = document.createElement('td');
+                const tdFinished = document.createElement('td');
+                const tdScore = document.createElement('td');
+                tdNo.appendChild(document.createTextNode("#" + attempt.id));
+                tdFinished.appendChild(document.createTextNode(attempt.finished ? "🍎" : "-"));
+                tdScore.appendChild(document.createTextNode(attempt.score));
+                tr.appendChild(tdNo);
+                tr.appendChild(tdFinished);
+                tr.appendChild(tdScore);
+            }
+        }
+
+        function startAttempt(id) {
+            log_dbg("Starting new attempt...");
+
+            const attempts = getAttemptsTableBody();
+            if (attempts.rows.length + 1 > KAS_MaxRows) {
+                attempts.deleteRow(0);
+            }
+
+            var attempt = new Object();
+            attempt.id = id;
+            attempt.score = 0;
+            attempt.finished = false;
+
+            addAttemptToTable(attempt);
+            KAS_AppleState = "playing";
+            updateProgressStyle(false);
+
+            const lastRow = attempts.rows[attempts.rows.length - 1];
+            lastRow.style = "background: #228b2280"
+        }
+
+        function finishAttempt(attempt) {
+            log_dbg("Attempt finished.")
+
+            const attempts = getAttemptsTableBody();
+
+            if (attempts.rows.length >= 1) {
+                const lastRow = attempts.rows[attempts.rows.length - 1];
+                const fin = lastRow.cells[1];
+                const score = lastRow.cells[2];
+                fin.innerHTML = attempt.finished ? "🍎" : "-";
+                score.innerHTML = attempt.score;
+                lastRow.style = "";
+            }
+
+            KAS_AppleState = "idle";
+            updateProgressStyle(true);
+        }
+
+        function updateProgress(progress) {
+            const score = document.getElementById("score");
+            const timer = document.getElementById("timer");
+
+            score.innerHTML = progress.score;
+            timer.innerHTML = formatTimeRemaining(progress.timeRemaining);
+
+            const attempts = getAttemptsTableBody();
+            const lastRow = attempts.rows[attempts.rows.length - 1];
+            const lastRowScore = lastRow.cells[2];
+            lastRowScore.innerHTML = progress.score;
+
+            updateProgressStyle(false);
+        }
+
+        function updateStats(stats) {
+            var bestScore = document.getElementById("bestscore");
+            var avgScore = document.getElementById("avgscore");
+            var playtime = document.getElementById("playtime");
+
+            bestScore.innerHTML = stats.bestScore;
+            avgScore.innerHTML = formatAvgScore(stats.avgScore);
+            playtime.innerHTML = formatPlaytime(stats.totalPlaytime);
+        }
+
+        function updateProgressStyle(finished) {
+            const score = document.getElementById("score");
+            const timer = document.getElementById("timer");
+
+            if (KAS_AppleState == "idle") {
+                score.style.color = finished ? "#ffcc00" : "";
+                timer.style.color = "";
+            } else {
+                score.style.color = "#00b4d8";
+
+                const t = parseFloat(timer.innerHTML);
+                if (t < 30.0) {
+                    timer.style.color = "#dd2222";
+                } else {
+                    timer.style.color = "";
+                }
+            }
+        }
+
+        function processMessage(message) {
+            const payload = JSON.parse(message);
+            if (payload === undefined) {
+                log_dbg("invalid payload!");
+                return;
+            }
+
+            if (payload.msg == "history") {
+                clearHistory();
+
+                var start = 0;
+                var end = payload.data.length;
+                if (payload.data.length > KAS_MaxRows) {
+                    start = payload.data.length - KAS_MaxRows;
+                }
+                for (var i = start; i < end; i += 1) {
+                    const attempt = payload.data[i];
+                    addAttemptToTable(attempt);
+                }
+            } else if (payload.msg == "attemptStart") {
+                startAttempt(payload.data);
+            } else if (payload.msg == "attemptEnd") {
+                finishAttempt(payload.data)
+            } else if (payload.msg == "progress") {
+                if (KAS_AppleState != "playing") {
+                    startAttempt(payload.data.id)
+                }
+
+                updateProgress(payload.data);
+            } else if (payload.msg == "stats") {
+                updateStats(payload.data);
+            }
+        }
+
+        function init() {
+            setInterval(tryConnectToServer, 500);
+        }
+
+        function formatPlaytime(playtime) {
+            var t = playtime;
+
+            var ss = t % 60;
+            t = (t - ss) / 60;
+
+            var mm = 0;
+            if (t > 0) {
+                mm = t % 60;
+                t = (t - mm) / 60;
+            }
+
+            var hh = 0;
+            if (t > 0) {
+                hh = t % 24;
+                t = (t - hh) / 24;
+            }
+
+            var dd = 0;
+            if (t > 0) {
+                dd = t;
+            }
+
+            var out = ""
+            if (dd > 0) {
+                out += dd + "d ";
+            }
+
+            if (hh > 0) {
+                if (hh < 10) { out += "0"; }
+                out += hh + "h ";
+            }
+
+            if (mm > 0) {
+                if (mm < 10) { out += "0"; }
+                out += mm + "m ";
+            }
+
+            if (ss < 10) { out += "0"; }
+            out += ss + "s";
+
+            return out;
+        }
+
+        function formatAvgScore(score) {
+            const rs = Math.round(score * 10) / 10;
+
+            var s = "" + rs;
+            if (s.indexOf(".") == -1) {
+                s += ".0";
+            }
+            return s;
+        }
+
+        function formatTimeRemaining(time) {
+            const rt = Math.round(time * 10) / 10;
+
+            var s = "" + rt;
+            if (s.indexOf(".") == -1) {
+                s += ".0";
+            }
+            return s;
+        }
+
+        function log_dbg(msg) {
+            if (KAS_Debug) {
+                if (arguments.length > 1) {
+                    console.log(msg, arguments);
+                } else {
+                    console.log(msg);
+                }
+            }
+        }
+
+        init();
+    </script>
+</head>
+
+<body>
+    <div id="history">
+        <table id="attempts">
+            <thead>
+                <tr>
+                    <th>Attempt No.</th>
+                    <th>Fin.</th>
+                    <th>Score</th>
+                </tr>
+            </thead>
+            <tbody>
+
+            </tbody>
+        </table>
+    </div>
+    <br />
+    <div id="progress">
+        <p id="score">0</p>
+        <p id="timer">120.0</p>
+    </div>
+    <div id="info" style="margin-top: 20px;">
+        <table id="stats">
+            <tr>
+                <td>Best Score:</td>
+                <td id="bestscore">0</td>
+            </tr>
+            <tr>
+                <td>Avg. Score:</td>
+                <td id="avgscore">0</td>
+            </tr>
+            <tr>
+                <td>Total playtime:</td>
+                <td id="playtime">0</td>
+            </tr>
+        </table>
+    </div>
+</body>
+
+</html>
